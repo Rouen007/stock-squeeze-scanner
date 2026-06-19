@@ -85,6 +85,96 @@ FALLBACK_QQQ_TOP_50 = [
 ]
 
 
+# NYSE full-day market holidays (closed). Hardcoded — covers 2025–2027.
+# Update annually from https://www.nyse.com/markets/hours-calendars
+NYSE_HOLIDAYS: set[dt.date] = {
+    dt.date(2025, 1, 1), dt.date(2025, 1, 9), dt.date(2025, 1, 20),
+    dt.date(2025, 2, 17), dt.date(2025, 4, 18), dt.date(2025, 5, 26),
+    dt.date(2025, 6, 19), dt.date(2025, 7, 4), dt.date(2025, 9, 1),
+    dt.date(2025, 11, 27), dt.date(2025, 12, 25),
+    dt.date(2026, 1, 1), dt.date(2026, 1, 19), dt.date(2026, 2, 16),
+    dt.date(2026, 4, 3), dt.date(2026, 5, 25), dt.date(2026, 6, 19),
+    dt.date(2026, 7, 3), dt.date(2026, 9, 7), dt.date(2026, 11, 26),
+    dt.date(2026, 12, 25),
+    dt.date(2027, 1, 1), dt.date(2027, 1, 18), dt.date(2027, 2, 15),
+    dt.date(2027, 3, 26), dt.date(2027, 5, 31), dt.date(2027, 6, 18),
+    dt.date(2027, 7, 5), dt.date(2027, 9, 6), dt.date(2027, 11, 25),
+    dt.date(2027, 12, 24),
+}
+
+# Early-close days (13:00 ET close — postmarket window shifts +3h vs normal).
+NYSE_HALF_DAYS: set[dt.date] = {
+    dt.date(2025, 7, 3), dt.date(2025, 11, 28), dt.date(2025, 12, 24),
+    dt.date(2026, 11, 27), dt.date(2026, 12, 24),
+    dt.date(2027, 11, 26), dt.date(2027, 12, 23),
+}
+
+
+def _third_friday(year: int, month: int) -> dt.date:
+    """Compute the 3rd Friday of the given (year, month) — quad witching day."""
+    d = dt.date(year, month, 1)
+    # Days to first Friday (weekday 4)
+    d += dt.timedelta(days=(4 - d.weekday()) % 7)
+    return d + dt.timedelta(weeks=2)
+
+
+def is_quad_witching(d: dt.date) -> bool:
+    """Quad witching = 3rd Friday of March, June, September, December.
+
+    When the 3rd Friday is a NYSE holiday (e.g. Juneteenth 2026-06-19), US
+    listed options expire on the preceding Thursday — so the effective quad
+    witching day shifts back one day.
+    """
+    if d.month not in (3, 6, 9, 12):
+        return False
+    third_fri = _third_friday(d.year, d.month)
+    if d == third_fri:
+        return third_fri not in NYSE_HOLIDAYS
+    return third_fri in NYSE_HOLIDAYS and d == third_fri - dt.timedelta(days=1)
+
+
+def is_last_trading_day_of_week(d: dt.date) -> bool:
+    """True if d is the final trading day of its (Mon–Fri) week.
+
+    Friday by default; Thursday if Friday is a NYSE holiday; further back
+    if multiple consecutive holidays.
+    """
+    if d.weekday() >= 5:  # Sat/Sun never trading
+        return False
+    # Walk forward through remaining weekdays to see if any are also trading.
+    cur = d + dt.timedelta(days=1)
+    while cur.weekday() < 5:  # Mon–Fri
+        if cur not in NYSE_HOLIDAYS:
+            return False
+        cur += dt.timedelta(days=1)
+    return True
+
+
+def date_context(d: dt.date) -> dict[str, Any]:
+    """Annotate a trade date with NYSE calendar context — caller decides what
+    to do with each flag.
+    """
+    weekday = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][d.weekday()]
+    tags: list[str] = []
+    if d in NYSE_HOLIDAYS:
+        tags.append("🚫 NYSE HOLIDAY (closed)")
+    if d in NYSE_HALF_DAYS:
+        tags.append("⏰ HALF-DAY (13:00 ET close)")
+    if is_quad_witching(d):
+        tags.append("🌀 QUAD WITCHING")
+    if is_last_trading_day_of_week(d) and d not in NYSE_HOLIDAYS:
+        tags.append("📅 last trading day of week")
+    return {
+        "date": d.isoformat(),
+        "weekday": weekday,
+        "is_holiday": d in NYSE_HOLIDAYS,
+        "is_half_day": d in NYSE_HALF_DAYS,
+        "is_quad_witching": is_quad_witching(d),
+        "is_last_weekday_of_week": is_last_trading_day_of_week(d),
+        "tags": tags,
+    }
+
+
 @dataclass
 class FetchResult:
     ticker: str
@@ -777,9 +867,19 @@ def main() -> int:
     parser.add_argument("--ibkr-client-id", type=int, default=1, help="Base clientId. When --ibkr-connections>1, uses base, base+1, ...")
     parser.add_argument("--ibkr-connections", type=int, default=1, help="Number of worker subprocesses, each with its own IB connection. NOTE: IBKR's account-level pacing (~60 historical requests / 10 min, shared across all clients) typically prevents real speedup — multi-conn is wired up for completeness but rarely helps. Default 1.")
     parser.add_argument("--ibkr-per-conn-concurrency", type=int, default=4, help="(deprecated, kept for CLI compat)")
+    parser.add_argument("--ignore-holiday", action="store_true", help="Scan even if --date is a NYSE holiday (default: refuse — no data exists).")
     args = parser.parse_args()
 
     trade_date = dt.date.fromisoformat(args.date) if args.date else dt.date.today()
+
+    # ── Calendar context — print upfront so downstream report has it ────────
+    ctx = date_context(trade_date)
+    tag_str = "  ".join(ctx["tags"]) if ctx["tags"] else "regular session"
+    print(f"[date] {ctx['date']} ({ctx['weekday']})  {tag_str}")
+    if ctx["is_holiday"] and not args.ignore_holiday:
+        print(f"[date] refusing: NYSE closed on {ctx['date']} — no tape data exists. Pass --ignore-holiday to override.")
+        return 2
+
     out_dir = Path(args.out_dir)
     raw_dir = out_dir / "raw" if args.save_raw else None
     sess = build_session()
@@ -823,8 +923,18 @@ def main() -> int:
     # IBKR uses threaded fanout (built after the serial non-ibkr loop, see below).
     # No persistent pool needed here.
 
-    ibkr_start_t = dt.time(16, 0) if args.markettype == "post" else dt.time(4, 0)
-    ibkr_end_t = dt.time(20, 0) if args.markettype == "post" else dt.time(9, 30)
+    # Default windows: post = 16:00–20:00 ET, pre = 04:00–09:30 ET.
+    # On half-days the regular session closes at 13:00 ET, so postmarket
+    # shifts to 13:00–17:00 ET (premarket unaffected).
+    if args.markettype == "post":
+        ibkr_start_t = dt.time(13, 0) if ctx["is_half_day"] else dt.time(16, 0)
+        ibkr_end_t = dt.time(17, 0) if ctx["is_half_day"] else dt.time(20, 0)
+    else:
+        ibkr_start_t = dt.time(4, 0)
+        ibkr_end_t = dt.time(9, 30)
+    if ctx["is_half_day"]:
+        print(f"[date] half-day detected — postmarket window shifted to "
+              f"{ibkr_start_t.strftime('%H:%M')}–{ibkr_end_t.strftime('%H:%M')} ET")
 
     all_trades: list[Trade] = []
     fetch_results: list[FetchResult] = []
@@ -922,8 +1032,9 @@ def main() -> int:
     finally:
         pass
 
-    start_time = dt.time(16, 0) if args.markettype == "post" else dt.time(4, 0)
-    end_time = dt.time(20, 0) if args.markettype == "post" else dt.time(9, 30)
+    # Reuse the IBKR window above (which already accounts for half-days).
+    start_time = ibkr_start_t
+    end_time = ibkr_end_t
     clusters = find_clusters(
         all_trades,
         start_time=start_time,
