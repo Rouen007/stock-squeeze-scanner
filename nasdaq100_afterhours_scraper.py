@@ -490,136 +490,93 @@ def fetch_ibkr_trades(
         return [], str(exc)
 
 
-def connect_ibkr_pool(
-    host: str, port: int, base_client_id: int, n: int
-) -> tuple[list[Any], list[str]]:
-    """Open N IB connections with sequential clientIds. Returns (pool, errors)."""
-    pool: list[Any] = []
-    errors: list[str] = []
-    for i in range(n):
-        ib, err = connect_ibkr(host, port, base_client_id + i)
-        if ib is None:
-            errors.append(f"clientId={base_client_id + i}: {err}")
-        else:
-            pool.append(ib)
-    return pool, errors
-
-
-async def fetch_ibkr_trades_async(
-    ib: Any,
-    ticker: str,
-    trade_date: dt.date,
-    start_time: dt.time,
-    end_time: dt.time,
-) -> tuple[list[Trade], str]:
-    """Async version of fetch_ibkr_trades — uses reqHistoricalTicksAsync.
-
-    Same pagination semantics; intended to be run via asyncio.gather across many
-    tickers (and optionally many IB connections) for ~Nx speedup over serial.
-    """
-    try:
-        from ib_insync import Stock  # type: ignore[import]
-    except ImportError:
-        return [], "ib_insync not installed"
-
-    try:
-        contract = Stock(ticker.upper(), "SMART", "USD")
-        await ib.qualifyContractsAsync(contract)
-
-        session_start = dt.datetime.combine(trade_date, start_time).replace(tzinfo=US_EASTERN)
-        session_end = dt.datetime.combine(trade_date, end_time).replace(tzinfo=US_EASTERN)
-
-        trades: list[Trade] = []
-        seen: set[tuple] = set()
-        current_start = session_start
-
-        while current_start < session_end:
-            start_str = current_start.strftime("%Y%m%d %H:%M:%S") + " US/Eastern"
-            ticks = await ib.reqHistoricalTicksAsync(
-                contract,
-                startDateTime=start_str,
-                endDateTime="",
-                numberOfTicks=1000,
-                whatToShow="TRADES",
-                useRth=False,
-                ignoreSize=False,
-                miscOptions=[],
-            )
-            if not ticks:
-                break
-
-            added = 0
-            last_ts: dt.datetime | None = None
-            for tick in ticks:
-                raw_ts = tick.time
-                if raw_ts.tzinfo is None:
-                    raw_ts = raw_ts.replace(tzinfo=US_EASTERN)
-                ts = raw_ts.astimezone(US_EASTERN)
-                if ts >= session_end:
-                    break
-                key = (int(ts.timestamp()), float(tick.price), int(tick.size))
-                if key not in seen:
-                    seen.add(key)
-                    trades.append(
-                        Trade(
-                            ticker=ticker.upper(),
-                            ts=ts,
-                            price=float(tick.price),
-                            size=int(tick.size),
-                            source="ibkr",
-                        )
-                    )
-                    added += 1
-                last_ts = ts
-
-            if len(ticks) < 1000 or added == 0 or last_ts is None:
-                break
-            current_start = last_ts + dt.timedelta(seconds=1)
-
-        return trades, ""
-
-    except Exception as exc:  # noqa: BLE001
-        return [], str(exc)
-
-
-async def fetch_ibkr_pool_async(
-    pool: list[Any],
+def _ibkr_worker(
+    host: str,
+    port: int,
+    client_id: int,
     tickers: list[str],
     trade_date: dt.date,
     start_time: dt.time,
     end_time: dt.time,
-    per_conn_concurrency: int = 4,
+    progress_cb: Any = None,
 ) -> dict[str, tuple[list[Trade], str]]:
-    """Fan out `tickers` across `pool` connections. Each connection processes up to
-    `per_conn_concurrency` tickers in parallel (IBKR allows ~6 concurrent historical
-    requests per client; 4 is a safe default).
+    """Thread worker: open one IB connection, fetch all assigned tickers serially.
 
-    Returns {ticker: (trades, error_str)}.
+    Each thread needs its own asyncio loop because ib_insync uses asyncio internally
+    and asyncio loops are not thread-safe.
     """
-    import asyncio as _asyncio
+    import asyncio
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
-    semaphores = [_asyncio.Semaphore(per_conn_concurrency) for _ in pool]
-
-    async def fetch_one(idx: int, ticker: str) -> tuple[str, list[Trade], str]:
-        conn_idx = idx % len(pool)
-        ib = pool[conn_idx]
-        sem = semaphores[conn_idx]
-        async with sem:
-            trades, err = await fetch_ibkr_trades_async(
-                ib, ticker, trade_date, start_time, end_time
-            )
-            return ticker, trades, err
-
-    tasks = [fetch_one(i, t) for i, t in enumerate(tickers)]
-    results = await _asyncio.gather(*tasks, return_exceptions=True)
     out: dict[str, tuple[list[Trade], str]] = {}
-    for i, res in enumerate(results):
-        ticker = tickers[i]
-        if isinstance(res, Exception):
-            out[ticker] = ([], str(res))
-        else:
-            _, trades, err = res
+    ib, err = connect_ibkr(host, port, client_id)
+    if ib is None:
+        for t in tickers:
+            out[t] = ([], f"connect failed: {err}")
+        return out
+
+    try:
+        for ticker in tickers:
+            trades, err = fetch_ibkr_trades(ib, ticker, trade_date, start_time, end_time)
             out[ticker] = (trades, err)
+            if progress_cb is not None:
+                try:
+                    progress_cb(client_id, ticker, len(trades), err)
+                except Exception:  # noqa: BLE001
+                    pass
+    finally:
+        try:
+            if ib.isConnected():
+                ib.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def fetch_ibkr_threaded(
+    host: str,
+    port: int,
+    base_client_id: int,
+    n_workers: int,
+    tickers: list[str],
+    trade_date: dt.date,
+    start_time: dt.time,
+    end_time: dt.time,
+    progress_cb: Any = None,
+) -> dict[str, tuple[list[Trade], str]]:
+    """Spread `tickers` across `n_workers` threads, each with its own IB connection.
+
+    Round-robin distribution: worker i gets tickers[i::n_workers]. Returns
+    {ticker: (trades, error_str)}.
+
+    Why threads not asyncio: ib_insync uses a single global asyncio loop, and
+    asyncio.gather over multiple IB() instances on that loop serializes in practice
+    (only the first task makes progress). Each thread gets its own loop + IB(),
+    which gives true parallel sockets to IB Gateway.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    n = max(1, min(n_workers, len(tickers)))
+    buckets: list[list[str]] = [[] for _ in range(n)]
+    for i, t in enumerate(tickers):
+        buckets[i % n].append(t)
+
+    out: dict[str, tuple[list[Trade], str]] = {}
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        futures = [
+            ex.submit(
+                _ibkr_worker,
+                host, port, base_client_id + i, buckets[i],
+                trade_date, start_time, end_time, progress_cb,
+            )
+            for i in range(n)
+        ]
+        for fut in as_completed(futures):
+            try:
+                out.update(fut.result())
+            except Exception as exc:  # noqa: BLE001
+                # Should not normally happen — _ibkr_worker traps its own errors
+                print(f"[ibkr] worker crashed: {exc}")
     return out
 
 
@@ -811,8 +768,8 @@ def main() -> int:
     parser.add_argument("--ibkr-host", default="127.0.0.1", help="TWS/Gateway host.")
     parser.add_argument("--ibkr-port", type=int, default=7497, help="7497=paper TWS, 7496=live TWS, 4002=IB Gateway.")
     parser.add_argument("--ibkr-client-id", type=int, default=1, help="Base clientId. When --ibkr-connections>1, uses base, base+1, ...")
-    parser.add_argument("--ibkr-connections", type=int, default=3, help="Number of parallel IB connections (each a distinct clientId). 1 = serial legacy path.")
-    parser.add_argument("--ibkr-per-conn-concurrency", type=int, default=4, help="Max concurrent ticker fetches per IB connection (IBKR allows ~6).")
+    parser.add_argument("--ibkr-connections", type=int, default=3, help="Number of worker threads, each with its own IB connection (distinct clientId). IBKR caps at ~32 clients per gateway; 3-5 is the sweet spot before account-level pacing throttles you.")
+    parser.add_argument("--ibkr-per-conn-concurrency", type=int, default=4, help="(deprecated, kept for CLI compat) Concurrent fetches per connection. Threaded path serializes tickers within a worker — set --ibkr-connections higher instead.")
     args = parser.parse_args()
 
     trade_date = dt.date.fromisoformat(args.date) if args.date else dt.date.today()
@@ -856,20 +813,8 @@ def main() -> int:
             "Finnhub source requires FINNHUB_API_KEY env var (or --finnhub-api-key)."
         )
 
-    # Build IBKR connection pool — N connections, sequential clientIds, fanned-out async
-    ibkr_pool: list[Any] = []
-    if "ibkr" in args.source:
-        n_conn = max(1, args.ibkr_connections)
-        ibkr_pool, conn_errs = connect_ibkr_pool(
-            args.ibkr_host, args.ibkr_port, args.ibkr_client_id, n_conn
-        )
-        for err in conn_errs:
-            print(f"[ibkr] {err}")
-        if not ibkr_pool:
-            print("[ibkr] no connections established — skipping ibkr source")
-            args.source = [s for s in args.source if s != "ibkr"]
-        else:
-            print(f"[ibkr] {len(ibkr_pool)}/{n_conn} connection(s) open, clientIds {args.ibkr_client_id}..{args.ibkr_client_id + len(ibkr_pool) - 1}")
+    # IBKR uses threaded fanout (built after the serial non-ibkr loop, see below).
+    # No persistent pool needed here.
 
     ibkr_start_t = dt.time(16, 0) if args.markettype == "post" else dt.time(4, 0)
     ibkr_end_t = dt.time(20, 0) if args.markettype == "post" else dt.time(9, 30)
@@ -938,26 +883,26 @@ def main() -> int:
             )
             time.sleep(args.sleep)
 
-        # IBKR parallel fan-out across the connection pool
-        if "ibkr" in args.source and ibkr_pool:
-            import asyncio as _asyncio
-            try:
-                from ib_insync import util as _ib_util  # type: ignore[import]
-                ibkr_results = _ib_util.run(
-                    fetch_ibkr_pool_async(
-                        ibkr_pool, tickers, trade_date,
-                        ibkr_start_t, ibkr_end_t,
-                        per_conn_concurrency=args.ibkr_per_conn_concurrency,
-                    )
-                )
-            except ImportError:
-                ibkr_results = _asyncio.run(
-                    fetch_ibkr_pool_async(
-                        ibkr_pool, tickers, trade_date,
-                        ibkr_start_t, ibkr_end_t,
-                        per_conn_concurrency=args.ibkr_per_conn_concurrency,
-                    )
-                )
+        # IBKR threaded fan-out: N worker threads, each with own IB connection
+        if "ibkr" in args.source:
+            n_workers = max(1, args.ibkr_connections)
+            print(f"[ibkr] threaded fetch: {n_workers} worker(s), clientIds "
+                  f"{args.ibkr_client_id}..{args.ibkr_client_id + n_workers - 1}, "
+                  f"{len(tickers)} ticker(s)")
+            t_ibkr0 = time.time()
+
+            def _progress(cid: int, ticker: str, n: int, err: str) -> None:
+                tag = f"[ibkr cid={cid}] {ticker}: {n} trades"
+                if err:
+                    tag += f" err={err[:80]}"
+                print(tag, flush=True)
+
+            ibkr_results = fetch_ibkr_threaded(
+                args.ibkr_host, args.ibkr_port, args.ibkr_client_id,
+                n_workers, tickers, trade_date, ibkr_start_t, ibkr_end_t,
+                progress_cb=_progress,
+            )
+            print(f"[ibkr] threaded fetch done in {time.time() - t_ibkr0:.1f}s")
 
             result_by_ticker = {fr.ticker: fr for fr in fetch_results}
             for ticker in tickers:
@@ -976,12 +921,7 @@ def main() -> int:
                     if err:
                         fr.error = (fr.error + "; " if fr.error else "") + f"ibkr:{err}"
     finally:
-        for ib in ibkr_pool:
-            try:
-                if ib.isConnected():
-                    ib.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
+        pass
 
     start_time = dt.time(16, 0) if args.markettype == "post" else dt.time(4, 0)
     end_time = dt.time(20, 0) if args.markettype == "post" else dt.time(9, 30)
