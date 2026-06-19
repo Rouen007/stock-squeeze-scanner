@@ -21,7 +21,7 @@ triggers:
 ## 环境要求
 
 ```
-项目路径：/Users/rouen/stock-squeeze-scanner/
+项目路径：<REPO_ROOT>/
 脚本：    nasdaq100_afterhours_scraper.py
 依赖：    pip install requests ib_insync
 IBKR：    IB Gateway 或 TWS 必须在运行
@@ -35,7 +35,7 @@ IBKR：    IB Gateway 或 TWS 必须在运行
 
 ```python
 # 快速检测（在项目目录内运行）
-cd /Users/rouen/stock-squeeze-scanner
+cd <REPO_ROOT>
 python3 -c "
 from nasdaq100_afterhours_scraper import connect_ibkr
 for port in [4001, 4002, 7496, 7497]:
@@ -77,7 +77,7 @@ for port in [4001, 4002, 7496, 7497]:
 ### 盘后大单（16:00–20:00 ET）
 
 ```bash
-cd /Users/rouen/stock-squeeze-scanner
+cd <REPO_ROOT>
 
 # 标的从共享清单 ~/.claude/watchlist.txt 读取（增删用 watchlist 技能）
 python3 nasdaq100_afterhours_scraper.py \
@@ -95,7 +95,7 @@ python3 nasdaq100_afterhours_scraper.py \
 ### 盘前大单（04:00–09:30 ET）
 
 ```bash
-cd /Users/rouen/stock-squeeze-scanner
+cd <REPO_ROOT>
 
 python3 nasdaq100_afterhours_scraper.py \
   --source ibkr \
