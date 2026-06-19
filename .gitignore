@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Scanner outputs (large, regenerable)
+outputs/
+
+# Local state / private session data
+.omc/
+
+# OS
+.DS_Store
+
+# Env / secrets
+.env
+.env.local
