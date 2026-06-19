@@ -119,6 +119,27 @@ Output CSVs written to `outputs/nasdaq_extended/`:
 - `*_trades.csv` — every individual tick normalized to `ticker/time/price/size/source`
 - `*_clusters.csv` — detected clusters with score/direction/notional
 
+### Sample structured report
+
+See [examples/2026-06-18_post_report.md](examples/2026-06-18_post_report.md) for a full real-world report generated from one scan: total notional ranking, MOC isolation, active-window sweeps, clusters, and multi-ticker coordination signals.
+
+### Performance & IBKR pacing reality
+
+IBKR's `reqHistoricalTicks` returns at most 1000 prints per call, paginated. For a 54-ticker watchlist over a 4-hour postmarket window, expect:
+
+- **Single-connection serial fetch: ~20–25 minutes wall time** (verified: 21:28 on 2026-06-18)
+- **Per-ticker cost**: ~1.5s/page × (trades / 1000). A mega-cap with 25k+ postmarket trades = 30–60s per ticker.
+
+We tried parallelizing via `asyncio`, `ThreadPoolExecutor`, and `ProcessPoolExecutor`. All three are wired up and selectable via `--ibkr-connections N`, but **none deliver real speedup** in practice:
+
+| Approach | What we saw |
+|---|---|
+| `asyncio.gather` | `ib_insync` caches one global event loop at module level. Multiple `IB()` instances on it serialize — only the first task makes progress. |
+| Threads | Same root cause: `util._loop` is module-shared; per-thread `asyncio.set_event_loop` doesn't override `ib_insync`'s cache. |
+| Subprocesses | Architecturally works — `lsof` confirms N distinct TCP sockets to the Gateway — but IBKR enforces account-level pacing (~60 historical requests / 10 min, shared across all clients). Only one client makes progress at a time; the rest's sockets are `ESTABLISHED` but silent. |
+
+**Default is `--ibkr-connections 1`** with an in-process fast path (no subprocess overhead). For real parallel speedup at production scale you'd need a paid feed with server-side filtering (Polygon `size.gt=`, Databento) — see commit history for the journey.
+
 ---
 
 ## 2. Short Squeeze Scanner (`scanner.py`)
