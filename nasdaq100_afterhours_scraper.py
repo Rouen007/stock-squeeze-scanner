@@ -554,9 +554,17 @@ def fetch_ibkr_threaded(
     all bind to the first thread's loop, so workers 2..N never make progress.
     Subprocesses get a fresh ib_insync import each.
     """
+    n = max(1, min(n_workers, len(tickers)))
+
+    # n=1 fast path: skip subprocess overhead, run in-process.
+    if n == 1:
+        return _ibkr_worker(
+            host, port, base_client_id, list(tickers),
+            trade_date, start_time, end_time,
+        )
+
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    n = max(1, min(n_workers, len(tickers)))
     buckets: list[list[str]] = [[] for _ in range(n)]
     for i, t in enumerate(tickers):
         buckets[i % n].append(t)
@@ -767,8 +775,8 @@ def main() -> int:
     parser.add_argument("--ibkr-host", default="127.0.0.1", help="TWS/Gateway host.")
     parser.add_argument("--ibkr-port", type=int, default=7497, help="7497=paper TWS, 7496=live TWS, 4002=IB Gateway.")
     parser.add_argument("--ibkr-client-id", type=int, default=1, help="Base clientId. When --ibkr-connections>1, uses base, base+1, ...")
-    parser.add_argument("--ibkr-connections", type=int, default=3, help="Number of worker threads, each with its own IB connection (distinct clientId). IBKR caps at ~32 clients per gateway; 3-5 is the sweet spot before account-level pacing throttles you.")
-    parser.add_argument("--ibkr-per-conn-concurrency", type=int, default=4, help="(deprecated, kept for CLI compat) Concurrent fetches per connection. Threaded path serializes tickers within a worker — set --ibkr-connections higher instead.")
+    parser.add_argument("--ibkr-connections", type=int, default=1, help="Number of worker subprocesses, each with its own IB connection. NOTE: IBKR's account-level pacing (~60 historical requests / 10 min, shared across all clients) typically prevents real speedup — multi-conn is wired up for completeness but rarely helps. Default 1.")
+    parser.add_argument("--ibkr-per-conn-concurrency", type=int, default=4, help="(deprecated, kept for CLI compat)")
     args = parser.parse_args()
 
     trade_date = dt.date.fromisoformat(args.date) if args.date else dt.date.today()
