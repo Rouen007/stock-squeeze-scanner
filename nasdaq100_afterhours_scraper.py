@@ -498,19 +498,21 @@ def _ibkr_worker(
     trade_date: dt.date,
     start_time: dt.time,
     end_time: dt.time,
-    progress_cb: Any = None,
 ) -> dict[str, tuple[list[Trade], str]]:
-    """Thread worker: open one IB connection, fetch all assigned tickers serially.
+    """Process worker: open one IB connection, fetch all assigned tickers serially.
 
-    Each thread needs its own asyncio loop because ib_insync uses asyncio internally
-    and asyncio loops are not thread-safe.
+    Runs as a child process. Prints per-ticker progress directly to stdout
+    (each line is atomic under POSIX since len < PIPE_BUF).
+
+    Why processes not threads: ib_insync caches a single asyncio loop at module
+    level (util._loop), so all threaded IB() instances share the first worker's
+    loop — only that thread makes progress. Subprocesses each import ib_insync
+    fresh, so each gets its own loop and truly parallel sockets.
     """
-    import asyncio
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
     out: dict[str, tuple[list[Trade], str]] = {}
     ib, err = connect_ibkr(host, port, client_id)
     if ib is None:
+        print(f"[ibkr cid={client_id}] connect failed: {err}", flush=True)
         for t in tickers:
             out[t] = ([], f"connect failed: {err}")
         return out
@@ -519,11 +521,10 @@ def _ibkr_worker(
         for ticker in tickers:
             trades, err = fetch_ibkr_trades(ib, ticker, trade_date, start_time, end_time)
             out[ticker] = (trades, err)
-            if progress_cb is not None:
-                try:
-                    progress_cb(client_id, ticker, len(trades), err)
-                except Exception:  # noqa: BLE001
-                    pass
+            tag = f"[ibkr cid={client_id}] {ticker}: {len(trades)} trades"
+            if err:
+                tag += f" err={err[:80]}"
+            print(tag, flush=True)
     finally:
         try:
             if ib.isConnected():
@@ -542,19 +543,18 @@ def fetch_ibkr_threaded(
     trade_date: dt.date,
     start_time: dt.time,
     end_time: dt.time,
-    progress_cb: Any = None,
+    progress_cb: Any = None,  # kept for CLI compat; ignored under process pool
 ) -> dict[str, tuple[list[Trade], str]]:
-    """Spread `tickers` across `n_workers` threads, each with its own IB connection.
+    """Spread `tickers` across `n_workers` subprocesses, each with its own IB
+    connection. Round-robin distribution: worker i gets tickers[i::n_workers].
+    Returns {ticker: (trades, error_str)}.
 
-    Round-robin distribution: worker i gets tickers[i::n_workers]. Returns
-    {ticker: (trades, error_str)}.
-
-    Why threads not asyncio: ib_insync uses a single global asyncio loop, and
-    asyncio.gather over multiple IB() instances on that loop serializes in practice
-    (only the first task makes progress). Each thread gets its own loop + IB(),
-    which gives true parallel sockets to IB Gateway.
+    Uses processes (not threads) because ib_insync's module-level asyncio loop
+    cache defeats threading — multiple IB() instances in the same Python process
+    all bind to the first thread's loop, so workers 2..N never make progress.
+    Subprocesses get a fresh ib_insync import each.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
     n = max(1, min(n_workers, len(tickers)))
     buckets: list[list[str]] = [[] for _ in range(n)]
@@ -562,12 +562,12 @@ def fetch_ibkr_threaded(
         buckets[i % n].append(t)
 
     out: dict[str, tuple[list[Trade], str]] = {}
-    with ThreadPoolExecutor(max_workers=n) as ex:
+    with ProcessPoolExecutor(max_workers=n) as ex:
         futures = [
             ex.submit(
                 _ibkr_worker,
                 host, port, base_client_id + i, buckets[i],
-                trade_date, start_time, end_time, progress_cb,
+                trade_date, start_time, end_time,
             )
             for i in range(n)
         ]
@@ -575,7 +575,6 @@ def fetch_ibkr_threaded(
             try:
                 out.update(fut.result())
             except Exception as exc:  # noqa: BLE001
-                # Should not normally happen — _ibkr_worker traps its own errors
                 print(f"[ibkr] worker crashed: {exc}")
     return out
 
@@ -890,17 +889,9 @@ def main() -> int:
                   f"{args.ibkr_client_id}..{args.ibkr_client_id + n_workers - 1}, "
                   f"{len(tickers)} ticker(s)")
             t_ibkr0 = time.time()
-
-            def _progress(cid: int, ticker: str, n: int, err: str) -> None:
-                tag = f"[ibkr cid={cid}] {ticker}: {n} trades"
-                if err:
-                    tag += f" err={err[:80]}"
-                print(tag, flush=True)
-
             ibkr_results = fetch_ibkr_threaded(
                 args.ibkr_host, args.ibkr_port, args.ibkr_client_id,
                 n_workers, tickers, trade_date, ibkr_start_t, ibkr_end_t,
-                progress_cb=_progress,
             )
             print(f"[ibkr] threaded fetch done in {time.time() - t_ibkr0:.1f}s")
 
