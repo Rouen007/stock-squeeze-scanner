@@ -1,5 +1,18 @@
 # Stock Squeeze & Institutional Sweep Scanner
 
+A toolkit for detecting institutional footprints in US equities during extended hours (04:00–09:30 and 16:00–20:00 ET), when option-dealer gamma hedging is offline and large prints more closely reflect directional intent.
+
+The core scanner connects to Interactive Brokers (IB Gateway / TWS) and pulls full SIP consolidated tick data for a configurable watchlist (defaults to Nasdaq-100 top weights). It surfaces two signal types:
+
+- **Clusters** — same-price repeated prints in a short window (iceberg / VWAP execution)
+- **Single sweeps** — individual prints above a configurable notional threshold
+
+Output is two CSVs per run (`clusters` + `trades`) plus a ranked notional summary by ticker. Fallback data sources (Nasdaq public API, Alpaca IEX, Finnhub) are included for environments without an IBKR account.
+
+---
+
+## Components
+
 Two complementary tools for pre/post-market edge detection:
 
 | Script | Purpose |
